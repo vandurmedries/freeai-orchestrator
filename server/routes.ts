@@ -4,11 +4,222 @@ import { storage } from "./storage";
 import { insertProviderSchema, insertTaskSchema, insertMessageSchema } from "@shared/schema";
 import { chat, chatWithFailover, type ChatMessage } from "./ai-engine";
 import { executeBrowserActions, scrapePage, type BrowserAction } from "./browser-engine";
+import { autoProvision } from "./auto-provision";
+import { KEY_FETCH_RECIPES, extractKeyFromText, validateKey, getKeyFromEnv } from "./key-fetcher";
+import { autoProvisionKey, autoProvisionAllKeys, getAutoProvisionStatus } from "./auto-key-provisioner";
 
 export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+
+  // ====== AUTO-PROVISIONING bij startup ======
+  autoProvision().then(result => {
+    console.log(`[startup] Auto-provisioning: ${result.added.length} providers toegevoegd, ${result.configured.length} keys geladen`);
+  }).catch(err => {
+    console.error(`[startup] Auto-provisioning fout: ${err.message}`);
+  });
+
+  // ====== PROVISION ENDPOINT ======
+  app.post("/api/provision", async (_req, res) => {
+    try {
+      const result = await autoProvision();
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/provision/status", async (_req, res) => {
+    const providers = await storage.getProviders();
+    const keyFree = providers.filter(p => {
+      if (!p.config) return false;
+      try { return JSON.parse(p.config).keyFree === true; } catch { return false; }
+    });
+    const withKey = providers.filter(p => p.apiKey && p.apiKey.length > 0);
+    const online = providers.filter(p => p.status === "online");
+
+    res.json({
+      totalProviders: providers.length,
+      keyFreeProviders: keyFree.length,
+      keyFreeOnline: keyFree.filter(p => p.status === "online").length,
+      configuredWithKey: withKey.length,
+      totalOnline: online.length,
+      providers: providers.map(p => ({
+        name: p.name,
+        type: p.type,
+        status: p.status,
+        keyFree: p.config ? (() => { try { return JSON.parse(p.config!).keyFree === true; } catch { return false; } })() : false,
+        hasKey: !!(p.apiKey && p.apiKey.length > 0),
+        latencyMs: p.latencyMs,
+      })),
+    });
+  });
+
+  // ====== AUTO KEY PROVISIONING ======
+  // Status van alle auto-provisionable providers
+  app.get("/api/auto-keys/status", async (_req, res) => {
+    const status = getAutoProvisionStatus();
+    const providers = await storage.getProviders();
+    
+    const enriched = status.map(s => {
+      const provider = providers.find(p =>
+        p.name.toLowerCase().includes(s.providerId.toLowerCase())
+      );
+      return {
+        ...s,
+        hasKey: !!(provider?.apiKey && provider.apiKey.length > 0),
+        isOnline: provider?.status === "online",
+      };
+    });
+    res.json(enriched);
+  });
+
+  // Automatisch key ophalen voor één provider
+  app.post("/api/auto-keys/provision/:providerId", async (req, res) => {
+    const { providerId } = req.params;
+    try {
+      const result = await autoProvisionKey(providerId);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Automatisch alle keys ophalen
+  app.post("/api/auto-keys/provision-all", async (_req, res) => {
+    try {
+      const results = await autoProvisionAllKeys();
+      res.json(results);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ====== KEY FETCHER ENDPOINTS ======
+  // Geeft alle recepten voor het ophalen van API keys
+  app.get("/api/keys/recipes", async (_req, res) => {
+    const providers = await storage.getProviders();
+    const recipes = KEY_FETCH_RECIPES.map(recipe => {
+      const matchingProvider = providers.find(p =>
+        p.name.toLowerCase().includes(recipe.providerId) ||
+        recipe.providerName.toLowerCase().split("(")[0].trim() === p.name.toLowerCase().split("(")[0].trim()
+      );
+      return {
+        providerId: recipe.providerId,
+        providerName: recipe.providerName,
+        method: recipe.method,
+        signupUrl: recipe.signupUrl,
+        keyPageUrl: recipe.keyPageUrl,
+        instructions: recipe.instructions,
+        hasKey: !!(matchingProvider?.apiKey && matchingProvider.apiKey.length > 0),
+        isOnline: matchingProvider?.status === "online",
+        internalId: matchingProvider?.id || null,
+      };
+    });
+    res.json(recipes);
+  });
+
+  // Ontvang een API key die de gebruiker heeft gekopieerd en sla op
+  app.post("/api/keys/submit", async (req, res) => {
+    const { providerId, apiKey } = req.body;
+    if (!providerId || !apiKey) {
+      return res.status(400).json({ error: "providerId en apiKey zijn vereist" });
+    }
+
+    const recipe = KEY_FETCH_RECIPES.find(r => r.providerId === providerId);
+    if (!recipe) {
+      return res.status(404).json({ error: "Provider niet gevonden" });
+    }
+
+    // Valideer key formaat
+    if (recipe.keyPattern && !recipe.keyPattern.test(apiKey)) {
+      return res.status(400).json({ 
+        error: "API key heeft een ongeldig formaat",
+        expectedPattern: recipe.keyPattern.source,
+      });
+    }
+
+    // Valideer key met test-request
+    const validation = await validateKey(recipe, apiKey);
+    if (!validation.valid) {
+      return res.status(400).json({ 
+        error: "API key is ongeldig of verlopen",
+        detail: validation.error,
+      });
+    }
+
+    // Zoek de provider en sla de key op
+    const providers = await storage.getProviders();
+    const matchingProvider = providers.find(p =>
+      p.name.toLowerCase().includes(recipe.providerId) ||
+      recipe.providerName.toLowerCase().split("(")[0].trim() === p.name.toLowerCase().split("(")[0].trim()
+    );
+
+    if (matchingProvider) {
+      await storage.updateProvider(matchingProvider.id, {
+        apiKey,
+        status: "online",
+      });
+      return res.json({ 
+        success: true, 
+        message: `${recipe.providerName} API key opgeslagen en gevalideerd`,
+        providerId: matchingProvider.id,
+      });
+    }
+
+    return res.status(404).json({ error: "Kon provider niet vinden in opslag" });
+  });
+
+  // Automatisch proberen keys te laden uit environment
+  app.post("/api/keys/auto-load", async (_req, res) => {
+    const results: Array<{ provider: string; loaded: boolean; validated: boolean }> = [];
+
+    for (const recipe of KEY_FETCH_RECIPES) {
+      if (recipe.method === "key_free") continue;
+
+      const envKey = getKeyFromEnv(recipe);
+      if (!envKey) {
+        results.push({ provider: recipe.providerName, loaded: false, validated: false });
+        continue;
+      }
+
+      const validation = await validateKey(recipe, envKey);
+      const providers = await storage.getProviders();
+      const matchingProvider = providers.find(p =>
+        p.name.toLowerCase().includes(recipe.providerId)
+      );
+
+      if (matchingProvider) {
+        await storage.updateProvider(matchingProvider.id, {
+          apiKey: envKey,
+          status: validation.valid ? "online" : "degraded",
+        });
+      }
+
+      results.push({ 
+        provider: recipe.providerName, 
+        loaded: true, 
+        validated: validation.valid,
+      });
+    }
+
+    res.json({ results });
+  });
+
+  // Extraheer een key uit tekst (voor clipboard paste)
+  app.post("/api/keys/extract", async (req, res) => {
+    const { providerId, text } = req.body;
+    const recipe = KEY_FETCH_RECIPES.find(r => r.providerId === providerId);
+    if (!recipe) return res.status(404).json({ error: "Provider niet gevonden" });
+
+    const key = extractKeyFromText(text, recipe);
+    if (key) {
+      res.json({ found: true, key });
+    } else {
+      res.json({ found: false, hint: `Verwacht formaat: ${recipe.keyPattern?.source || 'onbekend'}` });
+    }
+  });
 
   // ====== PROVIDERS ======
   app.get("/api/providers", async (_req, res) => {
