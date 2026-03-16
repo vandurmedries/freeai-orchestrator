@@ -1,0 +1,29 @@
+# FreeAI Orchestrator — Docker Compose
+# Start met: docker compose up -d
+
+services:
+  freeai:
+    build: .
+    container_name: freeai-orchestrator
+    restart: unless-stopped
+    ports:
+      - "${PORT:-5000}:5000"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - PORT=5000
+    # Playwright/Chromium heeft extra rechten nodig
+    security_opt:
+      - seccomp=unconfined
+    # Meer shared memory voor Chromium
+    shm_size: "2gb"
+    volumes:
+      # Optioneel: screenshots opslaan op host
+      - ./screenshots:/app/screenshots
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5000/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
