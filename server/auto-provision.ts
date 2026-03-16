@@ -33,6 +33,7 @@ export async function chatPollinations(
       model,
       jsonMode: false,
       seed: Math.floor(Math.random() * 100000),
+      private: true,
     }),
   });
 
