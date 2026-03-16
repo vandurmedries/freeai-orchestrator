@@ -5,6 +5,7 @@
  */
 
 import type { Provider } from "@shared/schema";
+import { chatDuckDuckGo, chatPollinations } from "./auto-provision";
 
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
@@ -174,7 +175,22 @@ export async function chat(
   try {
     let content: string;
 
-    if (provider.endpoint.includes("generativelanguage.googleapis.com")) {
+    // Key-vrije providers (Pollinations, DuckDuckGo)
+    if (provider.endpoint.startsWith("internal://pollinations")) {
+      // Haal het Pollinations model uit de config
+      let polModel = "openai";
+      if (provider.config) {
+        try {
+          const cfg = JSON.parse(provider.config);
+          polModel = cfg.pollinationsModel || "openai";
+        } catch {}
+      }
+      const polResult = await chatPollinations(messages, polModel);
+      content = polResult.content;
+    } else if (provider.endpoint.startsWith("internal://duckduckgo")) {
+      const ddgResult = await chatDuckDuckGo(messages, provider.model || "gpt-4o-mini");
+      content = ddgResult.content;
+    } else if (provider.endpoint.includes("generativelanguage.googleapis.com")) {
       content = await callGemini(provider, messages, controller.signal);
     } else if (provider.endpoint.includes("localhost:11434") || provider.endpoint.includes("ollama")) {
       content = await callOllama(provider, messages, controller.signal);
