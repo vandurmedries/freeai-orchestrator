@@ -5,7 +5,7 @@
  */
 
 import type { Provider } from "@shared/schema";
-import { chatDuckDuckGo, chatPollinations } from "./auto-provision";
+import { chatDuckDuckGo, chatPollinations, chatMultiSource } from "./auto-provision";
 
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
@@ -175,8 +175,12 @@ export async function chat(
   try {
     let content: string;
 
-    // Key-vrije providers (Pollinations, DuckDuckGo)
-    if (provider.endpoint.startsWith("internal://pollinations")) {
+    // Key-vrije providers (Multi-source, Pollinations, DuckDuckGo)
+    if (provider.endpoint === "internal://multi-source") {
+      // Multi-source: probeert alle gratis bronnen parallel
+      const msResult = await chatMultiSource(messages);
+      content = msResult.content;
+    } else if (provider.endpoint.startsWith("internal://pollinations")) {
       // Haal het Pollinations model uit de config
       let polModel = "openai";
       if (provider.config) {
